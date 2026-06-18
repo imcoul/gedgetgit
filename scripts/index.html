@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+</head>
+<body>
+<script>
+let cachedSecret = "";
+let db = null;
+
+function initDB() {
+    return new Promise((resolve) => {
+        const request = indexedDB.open("MobileIDEStore", 2);
+        request.onupgradeneeded = (e) => {
+            db = e.target.result;
+            if (!db.objectStoreNames.contains("workspace")) db.createObjectStore("workspace", { keyPath: "vaultKey" });
+            if (!db.objectStoreNames.contains("treeCache")) db.createObjectStore("treeCache", { keyPath: "repoKey" });
+        };
+        request.onsuccess = (e) => { db = e.target.result; resolve(db); };
+    });
+}
+
+function getLocalFile(vaultKey) {
+    return new Promise((resolve) => {
+        const tx = db.transaction("workspace", "readonly");
+        tx.objectStore("workspace").get(vaultKey).onsuccess = (e) => resolve(e.target.result || null);
+    });
+}
+
+function saveLocalFile(vaultKey, data) {
+    return new Promise((resolve) => {
+        const tx = db.transaction("workspace", "readwrite");
+        tx.objectStore("workspace").put({ vaultKey, ...data });
+        tx.oncomplete = () => resolve(true);
+    });
+}
+
+window['ai_edge_gallery_get_result'] = async (data, secret) => {
+    try {
+        if (secret) cachedSecret = secret;
+        if (!db) await initDB();
+        
+        const args = JSON.parse(data);
+        const { action, owner, repo, path = "", content = "", branch = "main", commitMsg = "Mobile Studio Refactor" } = args;
+        
+        const baseUrl = "https://api.github.com";
+        const headers = {
+            "Authorization": `Bearer ${cachedSecret}`,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json"
+        };
+        const vaultKey = `${owner}/${repo}/${path}`;
+
+        // DYNAMIC CHANGE LEDGER DIRECTORY EXPLORATION
+        if (action === "LIST_FILES") {
+            const response = await fetch(`${baseUrl}/repos/${owner}/${repo}/contents/${path}?ref=${branch}`, { headers: { ...headers, "Content-Type": undefined } });
+            if (!response.ok) throw new Error(`Fetch directory failed.`);
+            const items = await response.json();
+            
+            const processPromises = items.map(async (item) => {
+                if (item.type === 'dir') return `[DIR] 📁 ${item.path}`;
+                
+                const itemVaultKey = `${owner}/${repo}/${item.path}`;
+                const cachedRecord = await getLocalFile(itemVaultKey);
+                const isModified = cachedRecord && cachedRecord.local !== cachedRecord.remoteBase;
+                
+                return `[FILE] ${isModified ? '✏️ [MODIFIED STAGE]' : '📄 [UNCHANGED]'} ${item.path}`;
+            });
+            
+            const structureWithBadges = (await Promise.all(processPromises)).join("\n");
+            return JSON.stringify({ result: `Active Staging Status Matrix for branch '${branch}':\n\n${structureWithBadges}` });
+        }
+
+        if (action === "FETCH_FILE") {
+            const response = await fetch(`${baseUrl}/repos/${owner}/${repo}/contents/${path}?ref=${branch}`, { headers: { ...headers, "Content-Type": undefined } });
+            let remoteContent = "";
+            let fileSha = "";
+
+            if (response.ok) {
+                const fileData = await response.json();
+                remoteContent = decodeURIComponent(escape(atob(fileData.content)));
+                fileSha = fileData.sha;
+            }
+
+            let fileRecord = await getLocalFile(vaultKey);
+            if (!fileRecord) {
+                fileRecord = { local: remoteContent, remoteBase: remoteContent, sha: fileSha };
+                await saveLocalFile(vaultKey, fileRecord);
+            }
+
+            const webviewUrl = `webview.html?owner=${owner}&repo=${repo}&path=${path}&branch=${branch}&sha=${fileSha}`;
+            return JSON.stringify({
+                result: `Workspace tracking mounted for file target: '${path}'. UI editor panel updated below.`,
+                webview: { url: webviewUrl, aspectRatio: 0.8 }
+            });
+        }
+
+        if (action === "PUSH_BRANCH") {
+            const record = await getLocalFile(vaultKey);
+            if (!record || !record.local) throw new Error("No locally staged changes detected.");
+
+            const mainRes = await fetch(`${baseUrl}/repos/${owner}/${repo}/git/ref/heads/main`, { headers: { ...headers, "Content-Type": undefined } });
+            const rootSha = (await mainRes.json()).object.sha;
+
+            // Spawn separate branch target context
+            await fetch(`${baseUrl}/repos/${owner}/${repo}/git/refs`, {
+                method: "POST", headers, body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: rootSha })
+            });
+
+            // Write modification using custom user commit parameters
+            const finalRes = await fetch(`${baseUrl}/repos/${owner}/${repo}/contents/${path}`, {
+                method: "PUT",
+                headers,
+                body: JSON.stringify({
+                    message: commitMsg,
+                    content: btoa(unescape(encodeURIComponent(record.local))),
+                    sha: record.sha || undefined,
+                    branch: branch
+                })
+            });
+
+            if (!finalRes.ok) throw new Error("Git branch compilation transaction rejected by upstream API.");
+            record.remoteBase = record.local;
+            await saveLocalFile(vaultKey, record);
+            
+            return JSON.stringify({ result: `Refactor successfully committed and isolated upstream onto separate branch: '${branch}'.\nCommit message: "${commitMsg}"` });
+        }
+
+    } catch (e) { return JSON.stringify({ error: e.message }); }
+};
+
+window.addEventListener('message', async (event) => {
+    if (event.data && db) {
+        const { type, owner, repo, path, content } = event.data;
+        const vaultKey = `${owner}/${repo}/${path}`;
+        
+        if (type === "SYNC_LOCAL_CACHE") {
+            let record = await getLocalFile(vaultKey) || { remoteBase: "", sha: "" };
+            record.local = content;
+            await saveLocalFile(vaultKey, record);
+        }
+        if (type === "REQUEST_DB_LOAD") {
+            let record = await getLocalFile(vaultKey);
+            const frames = window.parent.document.getElementsByTagName('iframe');
+            for(let i=0; i<frames.length; i++) {
+                frames[i].contentWindow.postMessage({
+                    type: "LOAD_DB_RESPONSE",
+                    local: record?.local || "",
+                    remoteBase: record?.remoteBase || ""
+                }, "*");
+            }
+        }
+    }
+});
+</script>
+</body>
+</html>
